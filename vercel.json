@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "buildCommand": "",
+  "framework": null,
+  "functions": {
+    "api/**/*.ts": {
+      "memory": 1024,
+      "maxDuration": 30
+    }
+  },
+  "regions": ["lhr1"],
+  "crons": [
+    {
+      "path": "/api/cron/hemi-ping",
+      "schedule": "*/5 * * * *"
+    }
+  ],
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/router" },
+    { "source": "/(.*)", "destination": "/api/router" }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "name": "peeap-terminal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HEMI Y68/soundbox terminal control plane — split out of the main Peeap API for deploy isolation.",
+  "scripts": {
+    "build": "echo 'API only - no build required'",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "@vercel/functions": "^3.4.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@vercel/node": "^3.0.0",
+    "typescript": "^5.3.0"
+  }
+}
