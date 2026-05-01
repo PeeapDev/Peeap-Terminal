@@ -2420,7 +2420,13 @@ async function cloudSpeakerFetch(
   let json: any = await r.json().catch(() => ({}));
 
   // HEMI returns code 401/4001 for auth failures even when HTTP is 200.
-  const isAuthFail = r.status === 401 || json?.code === 401 || json?.code === 4001
+  // 403 also surfaces when the token is stale — observed at peeap-terminal
+  // first-deploy when the env-copied token had aged out. Re-login is
+  // cheap (~150ms) so widening the trigger is safe; if it's a true
+  // permission error the retry will return the same 403 and we surface
+  // it to the caller.
+  const isAuthFail = r.status === 401 || r.status === 403
+    || json?.code === 401 || json?.code === 4001
     || /token.*invalid|token.*expired/i.test(json?.msg || '');
 
   if (isAuthFail) {
