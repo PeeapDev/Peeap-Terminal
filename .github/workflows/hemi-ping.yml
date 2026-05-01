@@ -1,0 +1,59 @@
+name: HEMI fleet ping (5-min cron)
+
+# Vercel Hobby plan caps cron jobs at once-per-day, so the fleet-ping
+# runs from GitHub Actions instead. Every 5 minutes we POST to
+# /api/cron/hemi-ping, which:
+#   1. Pulls every device's current state from cloud-speaker.com
+#   2. Bulk-writes the fresh cloud_state into merchant_devices
+#   3. Calls the device-screen reconciler for every online device,
+#      self-healing any drift between DB profile and on-device screen
+#
+# The 5-min cadence is GitHub's minimum schedule resolution. Real
+# triggers can drift up to ~10 min during platform load — acceptable
+# because the reconciler is idempotent.
+#
+# Auth: Bearer ${{ secrets.HEMI_CRON_SECRET }} must equal the
+# CRON_SECRET env var on the peeap-terminal Vercel project. Mismatch
+# → 401 from the endpoint and the cron silently no-ops (with a red X
+# in the Actions tab so it's visible).
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:        # manual trigger from the Actions tab for debugging
+
+# Don't pile up a queue if a run takes longer than 5 min. We'd rather
+# skip a tick than ping the device fleet twice in parallel.
+concurrency:
+  group: hemi-ping
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4      # keep below the 5-min interval so concurrency never overlaps
+    steps:
+      - name: Hit /api/cron/hemi-ping
+        env:
+          ENDPOINT: https://peeap-terminal.vercel.app/api/cron/hemi-ping
+          SECRET: ${{ secrets.HEMI_CRON_SECRET }}
+        run: |
+          if [ -z "$SECRET" ]; then
+            echo "::error::HEMI_CRON_SECRET repo secret is not set."
+            echo "Set it at https://github.com/PeeapDev/Peeap-Terminal/settings/secrets/actions"
+            echo "Value must equal the CRON_SECRET env var on the peeap-terminal Vercel project."
+            exit 1
+          fi
+          # -f: fail on HTTP >=400 (so the workflow shows red on auth or 5xx)
+          # -sS: silent + show errors (no progress bar in logs, but errors visible)
+          # --max-time: cap the request duration so a hung cloud-speaker doesn't lock the runner
+          # --retry / --retry-delay: tolerate transient flakes; still fails if all attempts fail
+          curl -fsS \
+            --max-time 60 \
+            --retry 2 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            -X POST \
+            -H "Authorization: Bearer $SECRET" \
+            -H "Content-Type: application/json" \
+            "$ENDPOINT"
