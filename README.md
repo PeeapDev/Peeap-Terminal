@@ -1,8 +1,13 @@
 # Peeap Terminal
 
-HEMI Y68 / soundbox terminal control plane — the device-facing service for Peeap merchants.
+Vendor-agnostic merchant-terminal control plane for Peeap. Production at **https://terminal.peeap.com**.
 
-Split out of the main Peeap API (`api-deploy/`) for deploy isolation: a payments deploy can no longer break a terminal, and a terminal deploy cannot break payments.
+Currently implements the HEMI Y68 / soundbox device family via cloud-speaker.com. Naming convention:
+- **Public domain + Vercel project + repo** are vendor-agnostic (`terminal.peeap.com`, `peeap-terminal`).
+- **Code, env vars** are vendor-specific (`lib/handlers/hemi.ts`, `HEMI_USER_TOKEN`, `HEMI_BASE_URL`).
+- When a second vendor lands (Sunmi etc.), add `lib/handlers/sunmi.ts` and `SUNMI_*` env vars alongside — the public surface stays put.
+
+Split out of the main Peeap API (`Card/api-deploy/`) for deploy isolation: a payments deploy can no longer break a terminal, and a terminal deploy cannot break payments.
 
 ## What's in here
 
@@ -44,10 +49,16 @@ npm run typecheck
 
 ## Deploy
 
-Connected to Vercel project `peeap-terminal`. Production deploys via:
+Connected to Vercel project `peeap-terminal`, served at `terminal.peeap.com`. Production deploys via:
 
 ```bash
 npx vercel --prod --yes
+```
+
+Smoke test after deploy:
+```bash
+curl https://terminal.peeap.com/api/health
+# {"ok":true,"service":"peeap-terminal"}
 ```
 
 ## Self-healing
@@ -61,4 +72,14 @@ If a device's screen drifts from its DB state — paint failed, manual SQL chang
 
 ## Customer escape hatch
 
-`POST /api/hemi/devices/:sn/factory-reset` — auth required, allowed when device is unowned OR caller is owner. Routes through the reconciler. Surface this in the merchant Terminal UI as a "Force reset" button so a stuck merchant fixes themselves in one tap.
+`POST https://terminal.peeap.com/api/hemi/devices/:sn/factory-reset` — auth required, allowed when device is unowned OR caller is owner. Routes through the reconciler. Surface this in the merchant Terminal UI as a "Force reset" button so a stuck merchant fixes themselves in one tap.
+
+## Future: vendor-agnostic routes
+
+Routes today are `/api/hemi/*` (vendor-prefixed). Migration path when a second vendor arrives:
+
+1. Mount `/api/terminal/*` alias dispatching to the same handlers.
+2. Update `apps/web` clients to call `/api/terminal/*`.
+3. Drop `/api/hemi/*` after a soak period.
+
+Until then, vendor-agnosticism is honoured at the *domain* layer (`terminal.peeap.com`) and *implementation* boundary; routes will catch up when the trigger arrives.

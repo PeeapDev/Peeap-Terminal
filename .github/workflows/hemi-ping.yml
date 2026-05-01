@@ -35,7 +35,7 @@ jobs:
     steps:
       - name: Hit /api/cron/hemi-ping
         env:
-          ENDPOINT: https://peeap-terminal.vercel.app/api/cron/hemi-ping
+          ENDPOINT: https://terminal.peeap.com/api/cron/hemi-ping
           SECRET: ${{ secrets.HEMI_CRON_SECRET }}
         run: |
           if [ -z "$SECRET" ]; then
