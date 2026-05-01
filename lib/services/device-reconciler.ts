@@ -132,14 +132,20 @@ export async function reconcileDeviceScreen(deviceSn: string): Promise<Reconcile
 
   switch (target.kind) {
     case 'unclaimed': {
-      // Factory home image (empty payload = factory default), then dismiss
-      // any stuck wait-payment layer so the factory image is visible.
-      // Also reset audio override so the next claimer doesn't inherit
-      // the previous merchant's voice.
+      // Claim-QR home + dismiss wait-payment + reset audio override.
+      // The claim QR is what the merchant scans with their phone to
+      // pair the device — without it the device is unusable. Empty
+      // home (factory image) is the right state for a CLAIMED device
+      // sitting idle, but for UNCLAIMED we need the activation QR
+      // visible.
+      const claimUrl = `${FRONTEND_URL}/claim?sn=${encodeURIComponent(deviceSn)}`;
       const tasks = [
-        updateHomeScreen({ deviceSn, qrText: '', topLabel: '', bottomLabel: '' }).catch(
-          (e: any) => result.warnings.push(`home_paint:${e?.message || 'err'}`),
-        ),
+        updateHomeScreen({
+          deviceSn,
+          qrText: claimUrl,
+          topLabel: 'Scan with Peeap',
+          bottomLabel: 'to activate',
+        }).catch((e: any) => result.warnings.push(`home_paint:${e?.message || 'err'}`)),
         setPaymentResult({
           deviceSn,
           amount: 0,
