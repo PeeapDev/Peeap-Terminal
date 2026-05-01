@@ -145,17 +145,20 @@ export async function reconcileDeviceScreen(deviceSn: string): Promise<Reconcile
           qrText: claimUrl,
           topLabel: 'Scan with Peeap',
           bottomLabel: 'to activate',
-        }).catch((e: any) => result.warnings.push(`home_paint:${e?.message || 'err'}`)),
+        }).then(r => { if (!r.ok) result.warnings.push(`home_paint:${r.error}`); })
+          .catch((e: any) => result.warnings.push(`home_paint:throw:${e?.message || 'err'}`)),
         setPaymentResult({
           deviceSn,
           amount: 0,
           orderId: `reconcile_unclaimed_${Date.now()}`,
-        }).catch((e: any) => result.warnings.push(`dismiss_wait:${e?.message || 'err'}`)),
+        }).then(r => { if (!r.ok) result.warnings.push(`dismiss_wait:${r.error}`); })
+          .catch((e: any) => result.warnings.push(`dismiss_wait:throw:${e?.message || 'err'}`)),
         sendManualMessage({
           deviceSn,
           packetType: 'set_device_info',
           content: { play_audio: '' },
-        }).catch((e: any) => result.warnings.push(`audio_reset:${e?.message || 'err'}`)),
+        }).then(r => { if (!r.ok) result.warnings.push(`audio_reset:${r.error}`); })
+          .catch((e: any) => result.warnings.push(`audio_reset:throw:${e?.message || 'err'}`)),
       ];
       await Promise.all(tasks);
       result.painted = result.warnings.length === 0;
@@ -166,14 +169,15 @@ export async function reconcileDeviceScreen(deviceSn: string): Promise<Reconcile
       // Factory home + dismiss wait-payment. We don't paint a merchant
       // QR on idle anymore — see pushMerchantHomeScreen comment.
       const tasks = [
-        updateHomeScreen({ deviceSn, qrText: '', topLabel: '', bottomLabel: '' }).catch(
-          (e: any) => result.warnings.push(`home_paint:${e?.message || 'err'}`),
-        ),
+        updateHomeScreen({ deviceSn, qrText: '', topLabel: '', bottomLabel: '' })
+          .then(r => { if (!r.ok) result.warnings.push(`home_paint:${r.error}`); })
+          .catch((e: any) => result.warnings.push(`home_paint:throw:${e?.message || 'err'}`)),
         setPaymentResult({
           deviceSn,
           amount: 0,
           orderId: `reconcile_idle_${Date.now()}`,
-        }).catch((e: any) => result.warnings.push(`dismiss_wait:${e?.message || 'err'}`)),
+        }).then(r => { if (!r.ok) result.warnings.push(`dismiss_wait:${r.error}`); })
+          .catch((e: any) => result.warnings.push(`dismiss_wait:throw:${e?.message || 'err'}`)),
       ];
       await Promise.all(tasks);
       result.painted = result.warnings.length === 0;
@@ -192,7 +196,8 @@ export async function reconcileDeviceScreen(deviceSn: string): Promise<Reconcile
           qrText: gateUrl,
           topLabel: target.eventTitle.slice(0, 20),
           bottomLabel: 'Show pass to scan',
-        }).catch((e: any) => result.warnings.push(`home_paint:${e?.message || 'err'}`)),
+        }).then(r => { if (!r.ok) result.warnings.push(`home_paint:${r.error}`); })
+          .catch((e: any) => result.warnings.push(`home_paint:throw:${e?.message || 'err'}`)),
         setQrCodeData({
           deviceSn,
           amountDue: 0,
@@ -200,7 +205,8 @@ export async function reconcileDeviceScreen(deviceSn: string): Promise<Reconcile
           qrText: gateUrl,
           amountLabel: target.eventTitle.slice(0, 20),
           timeOutSec: 86400,
-        }).catch((e: any) => result.warnings.push(`wait_paint:${e?.message || 'err'}`)),
+        }).then(r => { if (!r.ok) result.warnings.push(`wait_paint:${r.error}`); })
+          .catch((e: any) => result.warnings.push(`wait_paint:throw:${e?.message || 'err'}`)),
       ];
       await Promise.all(tasks);
       result.painted = result.warnings.length === 0;

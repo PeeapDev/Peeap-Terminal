@@ -96,6 +96,135 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({ ok: true, service: 'peeap-terminal' });
     }
 
+    // Synchronous reconciler debug — auth: CRON_SECRET. Calls
+    // reconcileDeviceScreen for the given SN and returns warnings so
+    // we can see exactly which cloud-speaker paint failed. Used to
+    // diagnose stuck-screen issues end-to-end without grepping logs.
+    const reconcileMatch = path.match(/^debug\/reconcile\/([^/]+)$/);
+    if (reconcileMatch) {
+      const authHeader = req.headers.authorization || '';
+      const cronSecret = process.env.CRON_SECRET;
+      if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
+        return res.status(401).json({ error: 'unauthorized' });
+      }
+      const sn = decodeURIComponent(reconcileMatch[1]);
+      const { reconcileDeviceScreen } = await import('../lib/services/device-reconciler');
+      const result = await reconcileDeviceScreen(sn);
+      return res.status(200).json(result);
+    }
+
+    // Wire-level cloud-speaker debug — returns the raw response of each
+    // paint call so we can see what HEMI is actually doing with our
+    // packets. Auth: CRON_SECRET.
+    const wireMatch = path.match(/^debug\/wire\/([^/]+)$/);
+    if (wireMatch) {
+      const authHeader = req.headers.authorization || '';
+      const cronSecret = process.env.CRON_SECRET;
+      if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
+        return res.status(401).json({ error: 'unauthorized' });
+      }
+      const sn = decodeURIComponent(wireMatch[1]);
+      const apiBase = (process.env.HEMI_BASE_URL || 'https://api.cloud-speaker.com').trim();
+      const soundboxBase = (process.env.HEMI_SOUNDBOX_BASE || 'http://47.254.244.245:8188').trim();
+      const apiKey = (process.env.HEMI_API_KEY || '').trim();
+      if (!apiKey) return res.status(500).json({ error: 'HEMI_API_KEY not set' });
+
+      // Match real updateHomeScreen field names exactly (qrcode_1_content
+      // not qrCodeText, label_1_content not topText, etc.) — these come
+      // from the HEMI soundbox webhook contract documented elsewhere.
+      const requestId = `wire_${Date.now()}`;
+      const homeBody = {
+        deviceNumber: sn,
+        requestId,
+        timeStamp: Math.floor(Date.now() / 1000),
+        qrcode_1_content: `https://my.peeap.com/claim?sn=${encodeURIComponent(sn)}`,
+        label_1_content: 'Scan with Peeap',
+        label_1_height: 32,
+        label_3_content: 'to activate',
+        label_3_height: 24,
+      };
+      const homeResp = await fetch(`${soundboxBase}/webhook/update_home_screen`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+        body: JSON.stringify(homeBody),
+      }).then(async r => ({ status: r.status, body: await r.text() })).catch((e: any) => ({ status: 0, body: e?.message }));
+
+      // set_payment_result lives on api.cloud-speaker.com (not soundbox).
+      const dismissResp = await fetch(`${apiBase}/api/set_payment_result`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+        body: JSON.stringify({
+          deviceNumber: sn,
+          playPaymentAmount: 0,
+          orderId: `wire_${Date.now()}`,
+        }),
+      }).then(async r => ({ status: r.status, body: await r.text() })).catch((e: any) => ({ status: 0, body: e?.message }));
+
+      // set_qr_code_data with the real nested screenContent shape from
+      // the production setQrCodeData function (not the flat shape).
+      const overwriteResp = await fetch(`${apiBase}/api/set_qr_code_data`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+        body: JSON.stringify({
+          deviceNumber: sn,
+          amountDue: 0,
+          orderId: `wire_${Date.now()}`,
+          timeOut: 5,
+          screenContent: {
+            wait_payment_screen_qrcode_1_config: {
+              txt: `https://my.peeap.com/claim?sn=${encodeURIComponent(sn)}`,
+            },
+            wait_payment_screen_label_3_config: { txt: 'Activate' },
+          },
+        }),
+      }).then(async r => ({ status: r.status, body: await r.text() })).catch((e: any) => ({ status: 0, body: e?.message }));
+
+      // Use sendManualMessage so cloudSpeakerFetch auto-refreshes the
+      // user token (HEMI_USER_TOKEN env was stale from initial copy).
+      const { sendManualMessage } = await import('../lib/handlers/hemi');
+      const manualHomeResp = await sendManualMessage({
+        deviceSn: sn,
+        packetType: 'update_home_screen',
+        content: {
+          qrcode_1_content: `https://my.peeap.com/claim?sn=${encodeURIComponent(sn)}`,
+          label_1_content: 'Scan with Peeap',
+          label_1_height: 32,
+          label_3_content: 'to activate',
+          label_3_height: 24,
+        },
+      });
+      const manualPaymentResp = await sendManualMessage({
+        deviceSn: sn,
+        packetType: 'set_payment_result',
+        content: { playPaymentAmount: 0, orderId: `manual_${Date.now()}` },
+      });
+      const manualQrResp = await sendManualMessage({
+        deviceSn: sn,
+        packetType: 'set_qr_code_data',
+        content: {
+          orderId: `manual_${Date.now()}`,
+          qrCodeData: `https://my.peeap.com/claim?sn=${encodeURIComponent(sn)}`,
+          amountDue: 0,
+          amountLabel: 'Activate',
+          timeOutSec: 5,
+        },
+      });
+
+      return res.status(200).json({
+        device_sn: sn,
+        soundbox_base: soundboxBase,
+        api_base: apiBase,
+        // X-API-Key path
+        update_home_screen: homeResp,
+        set_payment_result: dismissResp,
+        set_qr_code_data_overwrite: overwriteResp,
+        // user-token portal path (with auto-refresh)
+        manual_update_home: manualHomeResp,
+        manual_set_payment: manualPaymentResp,
+        manual_set_qr_code: manualQrResp,
+      });
+    }
+
     // ── Cron ────────────────────────────────────────────────────────────
     if (path === 'cron/hemi-ping') {
       return await handleCronHemiPing(req, res);
