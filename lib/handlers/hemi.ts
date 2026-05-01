@@ -2165,11 +2165,51 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
     return res.status(400).json({ error: 'device_sn_required' });
   }
 
-  const { data: device, error: devErr } = await supabase
+  let { data: device, error: devErr } = await supabase
     .from('merchant_devices')
     .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id, security_flag, reported_stolen_by')
     .eq('device_sn', sn)
     .maybeSingle();
+
+  // Auto-import on first claim: if we don't have this SN locally but
+  // cloud-speaker confirms it sits on our peeappay account, insert it
+  // and let the claim proceed. This keeps the trust model intact —
+  // cloud-speaker only enumerates devices we physically own — while
+  // removing the manual /api/hemi/sync step that was previously
+  // required for every brand-new shipment.
+  if (devErr || !device) {
+    const csList = await cloudSpeakerListDevices();
+    const csRow = csList.ok && csList.devices
+      ? csList.devices.find((d: any) => d?.deviceNumber === sn)
+      : undefined;
+    if (csRow) {
+      const { data: imported, error: importErr } = await supabase
+        .from('merchant_devices')
+        .insert({
+          device_sn: sn,
+          device_secret: randomBytes(24).toString('base64url'),
+          owner_user_id: null,
+          model: csRow.deviceModel || 'y68',
+          profile: 'merchant',
+          status: 'active',
+          cloud_state: {
+            deviceModel: csRow.deviceModel,
+            networkStatus: csRow.networkStatus,
+            networkMode: csRow.network_mode,
+            wifiName: csRow.wifi_name,
+            batteryPercent: csRow.battery_percent,
+            lastReportAt: csRow.lastReportDataTime,
+            ip: csRow.ip,
+          },
+          last_synced_at: new Date().toISOString(),
+        })
+        .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id, security_flag, reported_stolen_by')
+        .single();
+      if (!importErr && imported) {
+        device = imported;
+      }
+    }
+  }
 
   if (devErr || !device) {
     return res.status(404).json({ error: 'device_not_in_inventory' });
