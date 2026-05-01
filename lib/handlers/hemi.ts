@@ -576,16 +576,21 @@ export async function handleHemiKeypadInbound(
         return;
       }
 
-      // Unclaimed → push activation QR onto the payment screen so the
-      // cashier sees a path forward instead of a stalled "connecting".
+      // Unclaimed → paint a "POS not connected" QR on the wait-payment
+      // screen with the amount the cashier typed. When the customer
+      // scans, they land on /pos-disconnected which shows a clear
+      // message ("This terminal is not connected to a merchant — ask
+      // the cashier to activate it") instead of a payment surface they
+      // can't actually pay through. The amount echoes the keypad press
+      // so the cashier sees their input was received.
       if (!device.claimed_at || !device.owner_user_id) {
-        const claimUrl = `${FRONTEND_URL}/claim?sn=${encodeURIComponent(deviceNumber)}`;
+        const disconnectedUrl = `${FRONTEND_URL}/pos-disconnected?sn=${encodeURIComponent(deviceNumber)}&amount=${encodeURIComponent(String(amountDue))}`;
         await setQrCodeData({
           deviceSn: deviceNumber,
-          amountDue: 0,
-          orderId: `claim-${Date.now()}`,
-          qrText: claimUrl,
-          amountLabel: 'Activate',
+          amountDue,
+          orderId: `disc_${Date.now()}`,
+          qrText: disconnectedUrl,
+          amountLabel: 'Not connected',
         });
         return;
       }
@@ -1188,6 +1193,77 @@ export async function handleHemiDeviceFactoryReset(
     target_state: result.targetKind,
     warnings: result.warnings,
   });
+}
+
+// ─── Merchant: report device as stolen (honeypot mode) ────────────────
+//
+// Owner-only. Doesn't block future claims — the device stays "active"
+// to anyone scanning the activation QR. What changes:
+//   - merchant_devices.security_flag = 'reported_stolen'
+//   - reported_stolen_at + reported_stolen_by recorded
+//   - owner_user_id cleared so a re-claim flow can run
+//   - logAlert fires immediately so admins know a theft is in motion
+//
+// The honeypot itself triggers in handleHemiClaimBySn — when a flagged
+// device is claimed by a new user, that handler captures their identity,
+// IP, UA, and fires a critical system_alerts row + admin notification.
+// The claimer doesn't see anything different from a normal claim.
+//
+// Why honeypot vs hard-block: a hard block tells the holder it's stolen,
+// they discard or resell to someone else, and we lose the trail. A
+// honeypot recovers identity instead of just losing the asset.
+export async function handleHemiDeviceReportStolen(
+  req: VercelRequest,
+  res: VercelResponse,
+  deviceSn: string,
+) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+  const userId = await getAuthenticatedUserId(req);
+  if (!userId) return res.status(401).json({ error: 'unauthorized' });
+
+  const { data: device } = await supabase
+    .from('merchant_devices')
+    .select('id, device_sn, owner_user_id, terminal_label, security_flag')
+    .eq('device_sn', deviceSn)
+    .maybeSingle();
+  if (!device) return res.status(404).json({ error: 'device_not_found' });
+  if (device.owner_user_id !== userId) return res.status(403).json({ error: 'not_your_device' });
+
+  // Close any open shift on the device — staff in the field have nothing
+  // useful to do with a reported-stolen device.
+  await supabase
+    .from('device_shifts')
+    .update({ ended_at: new Date().toISOString(), metadata: { closed_via: 'theft_report' } })
+    .eq('device_sn', deviceSn)
+    .is('ended_at', null);
+
+  const { error } = await supabase
+    .from('merchant_devices')
+    .update({
+      security_flag: 'reported_stolen',
+      reported_stolen_at: new Date().toISOString(),
+      reported_stolen_by: userId,
+      // Clear ownership so a re-claim by the holder triggers the honeypot
+      // capture in handleHemiClaimBySn. We deliberately keep status='active'
+      // so the holder doesn't realise the device is flagged.
+      owner_user_id: null,
+      claimed_at: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', device.id);
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Surface to admin observability immediately. fraud / police liaison
+  // monitors system_alerts for this code.
+  await logAlert(
+    'critical',
+    'hemi_theft_report',
+    'device_reported_stolen',
+    `Device ${deviceSn} (${device.terminal_label || 'unlabelled'}) reported stolen by user ${userId}`,
+    { device_sn: deviceSn, reported_by: userId, terminal_label: device.terminal_label },
+  );
+
+  return res.status(200).json({ ok: true });
 }
 
 // ─── Merchant: end the current shift on a device they own ──────────────
@@ -2091,7 +2167,7 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
 
   const { data: device, error: devErr } = await supabase
     .from('merchant_devices')
-    .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id')
+    .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id, security_flag, reported_stolen_by')
     .eq('device_sn', sn)
     .maybeSingle();
 
@@ -2099,6 +2175,11 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
     return res.status(404).json({ error: 'device_not_in_inventory' });
   }
   if (device.status !== 'active') {
+    return res.status(403).json({ error: 'device_disabled' });
+  }
+  // 'fraud_hold' is a hard block (admin-set). 'reported_stolen' is a
+  // honeypot — claim proceeds normally; we capture identity below.
+  if (device.security_flag === 'fraud_hold') {
     return res.status(403).json({ error: 'device_disabled' });
   }
 
@@ -2167,6 +2248,54 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
     amount: 0,
     orderId: `claim_${Date.now()}`,
   }).catch(err => console.warn('[HEMI claim] dismiss wait-payment failed:', err?.message));
+
+  // ── Theft honeypot ────────────────────────────────────────────────
+  // If the device was reported stolen, the claim above looked normal
+  // to the holder. We log everything we have on them out-of-band: full
+  // user record, IP, UA, plus a notification to the original reporter.
+  // The fraud team (or police, via fraud team) gets a critical alert.
+  // We do NOT tell the claimer anything is amiss — the whole point.
+  if (device.security_flag === 'reported_stolen') {
+    const claimerIp = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim()
+      || (req.headers['x-real-ip'] as string | undefined)
+      || 'unknown';
+    const claimerUa = (req.headers['user-agent'] as string | undefined) || 'unknown';
+    const { data: claimer } = await supabase
+      .from('users')
+      .select('id, first_name, last_name, phone, email, kyc_status, kyc_tier, created_at')
+      .eq('id', userId)
+      .single();
+    void logAlert(
+      'critical',
+      'hemi_theft_honeypot',
+      'stolen_device_claimed',
+      `Stolen device ${device.device_sn} was claimed — capture identity for investigation`,
+      {
+        device_sn: device.device_sn,
+        claimer_user_id: userId,
+        claimer_phone: claimer?.phone,
+        claimer_name: claimer ? `${claimer.first_name || ''} ${claimer.last_name || ''}`.trim() : null,
+        claimer_email: claimer?.email,
+        claimer_kyc: { status: claimer?.kyc_status, tier: claimer?.kyc_tier },
+        claimer_account_age_days: claimer?.created_at
+          ? Math.floor((Date.now() - new Date(claimer.created_at).getTime()) / 86400000)
+          : null,
+        claimer_ip: claimerIp,
+        claimer_user_agent: claimerUa,
+        original_owner_user_id: device.reported_stolen_by,
+      },
+    );
+    // Notify the original owner that their stolen device just resurfaced.
+    if (device.reported_stolen_by) {
+      void supabase.from('notifications').insert({
+        user_id: device.reported_stolen_by,
+        type: 'theft_honeypot_triggered',
+        title: 'Your reported device was just claimed',
+        message: `Device ${device.device_sn} was claimed by another user. Our team is investigating — do not contact the claimer or the police directly. We will update you.`,
+        data: { device_sn: device.device_sn },
+      });
+    }
+  }
 
   return res.status(200).json({ device: claimed });
 }

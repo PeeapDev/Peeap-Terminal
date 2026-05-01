@@ -53,6 +53,7 @@ import {
   handleHemiDeviceClaim,
   handleHemiDeviceRelease,
   handleHemiDeviceFactoryReset,
+  handleHemiDeviceReportStolen,
   handleHemiDeviceEndShift,
   handleHemiDeviceBindEvent,
   handleHemiMyEvents,
@@ -210,6 +211,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
       });
 
+      // The real fix: set_device_info → static_qrcode_content. This is
+      // the device's permanent idle QR (not an overlay) and goes through
+      // /manual_message + user-token auth which actually works.
+      const staticQrResp = await sendManualMessage({
+        deviceSn: sn,
+        packetType: 'set_device_info',
+        content: {
+          static_qrcode_content: `https://my.peeap.com/claim?sn=${encodeURIComponent(sn)}`,
+        },
+      });
+
+      // ack_payment dismisses the current payment cycle (which is what
+      // was leaving the wait-payment overlay stuck on screen).
+      const ackPaymentResp = await sendManualMessage({
+        deviceSn: sn,
+        packetType: 'set_device_info',
+        content: { ack_payment: true },
+      });
+
       return res.status(200).json({
         device_sn: sn,
         soundbox_base: soundboxBase,
@@ -222,6 +242,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         manual_update_home: manualHomeResp,
         manual_set_payment: manualPaymentResp,
         manual_set_qr_code: manualQrResp,
+        // The real paint path
+        static_qr_set: staticQrResp,
+        ack_payment: ackPaymentResp,
       });
     }
 
@@ -265,6 +288,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           return await handleHemiDeviceRelease(req, res, sn);
         case 'factory-reset':
           return await handleHemiDeviceFactoryReset(req, res, sn);
+        case 'report-stolen':
+          return await handleHemiDeviceReportStolen(req, res, sn);
         case 'end-shift':
           return await handleHemiDeviceEndShift(req, res, sn);
         case 'bind-event':

@@ -166,11 +166,22 @@ export async function reconcileDeviceScreen(deviceSn: string): Promise<Reconcile
     }
 
     case 'merchant_idle': {
-      // Factory home + dismiss wait-payment. We don't paint a merchant
-      // QR on idle anymore — see pushMerchantHomeScreen comment.
+      // Paint a Peeap brand home overlay + dismiss wait-payment.
+      //
+      // Why not empty home: the HEMI firmware's factory-default home
+      // image IS the activation/claim QR — confirmed live on
+      // 2512230002 after claim. So an "empty payload" paint clears
+      // our overlay, exposing the firmware claim screen, which is
+      // confusing for an already-claimed merchant device. We paint
+      // a deliberate brand QR so the claim screen stays hidden.
+      const brandUrl = 'https://my.peeap.com';
       const tasks = [
-        updateHomeScreen({ deviceSn, qrText: '', topLabel: '', bottomLabel: '' })
-          .then(r => { if (!r.ok) result.warnings.push(`home_paint:${r.error}`); })
+        updateHomeScreen({
+          deviceSn,
+          qrText: brandUrl,
+          topLabel: 'Peeap',
+          bottomLabel: 'Ready',
+        }).then(r => { if (!r.ok) result.warnings.push(`home_paint:${r.error}`); })
           .catch((e: any) => result.warnings.push(`home_paint:throw:${e?.message || 'err'}`)),
         setPaymentResult({
           deviceSn,
