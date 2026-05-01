@@ -152,11 +152,17 @@ export async function updateHomeScreen(params: {
     qrcode_1_content: params.qrText,
     ...(params.qrColor && { qrcode_1_color: params.qrColor }),
   };
-  if (params.topLabel) {
+  // undefined = leave previous label as-is on the device
+  // '' (empty string) = explicitly clear the label cell
+  // any other string = set the label
+  // The previous truthy-only check meant '' was treated as "don't send"
+  // and the old label persisted — confirmed observed on 2512230002
+  // after first claim.
+  if (params.topLabel !== undefined) {
     body.label_1_content = params.topLabel;
     body.label_1_height = 32;
   }
-  if (params.bottomLabel) {
+  if (params.bottomLabel !== undefined) {
     body.label_3_content = params.bottomLabel;
     body.label_3_height = 24;
   }
