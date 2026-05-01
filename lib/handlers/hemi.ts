@@ -2165,9 +2165,15 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
     return res.status(400).json({ error: 'device_sn_required' });
   }
 
+  // Don't include security_flag / reported_stolen_by in the main SELECT.
+  // Migration 009 (security columns) is optional — if it hasn't run, a
+  // referenced-but-missing column blows up the entire query with
+  // PG 42703 and the API returns device_not_in_inventory falsely. We
+  // load the security fields in a separate try-catch below so the
+  // claim flow keeps working in either schema state.
   let { data: device, error: devErr } = await supabase
     .from('merchant_devices')
-    .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id, security_flag, reported_stolen_by')
+    .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id')
     .eq('device_sn', sn)
     .maybeSingle();
 
@@ -2203,7 +2209,7 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
           },
           last_synced_at: new Date().toISOString(),
         })
-        .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id, security_flag, reported_stolen_by')
+        .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id')
         .single();
       if (!importErr && imported) {
         device = imported;
@@ -2217,9 +2223,25 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
   if (device.status !== 'active') {
     return res.status(403).json({ error: 'device_disabled' });
   }
+
+  // Optional security fields (migration 009). Best-effort — if the
+  // columns don't exist yet, we just skip the honeypot logic.
+  let securityFlag: string | null = null;
+  let reportedStolenBy: string | null = null;
+  try {
+    const { data: sec } = await supabase
+      .from('merchant_devices')
+      .select('security_flag, reported_stolen_by' as any)
+      .eq('id', device.id)
+      .maybeSingle();
+    securityFlag = (sec as any)?.security_flag ?? null;
+    reportedStolenBy = (sec as any)?.reported_stolen_by ?? null;
+  } catch {
+    // Migration 009 not yet run — honeypot is disabled, claim proceeds
+  }
   // 'fraud_hold' is a hard block (admin-set). 'reported_stolen' is a
   // honeypot — claim proceeds normally; we capture identity below.
-  if (device.security_flag === 'fraud_hold') {
+  if (securityFlag === 'fraud_hold') {
     return res.status(403).json({ error: 'device_disabled' });
   }
 
@@ -2295,7 +2317,7 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
   // user record, IP, UA, plus a notification to the original reporter.
   // The fraud team (or police, via fraud team) gets a critical alert.
   // We do NOT tell the claimer anything is amiss — the whole point.
-  if (device.security_flag === 'reported_stolen') {
+  if (securityFlag === 'reported_stolen') {
     const claimerIp = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim()
       || (req.headers['x-real-ip'] as string | undefined)
       || 'unknown';
@@ -2322,13 +2344,13 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
           : null,
         claimer_ip: claimerIp,
         claimer_user_agent: claimerUa,
-        original_owner_user_id: device.reported_stolen_by,
+        original_owner_user_id: reportedStolenBy,
       },
     );
     // Notify the original owner that their stolen device just resurfaced.
-    if (device.reported_stolen_by) {
+    if (reportedStolenBy) {
       void supabase.from('notifications').insert({
-        user_id: device.reported_stolen_by,
+        user_id: reportedStolenBy,
         type: 'theft_honeypot_triggered',
         title: 'Your reported device was just claimed',
         message: `Device ${device.device_sn} was claimed by another user. Our team is investigating — do not contact the claimer or the police directly. We will update you.`,
