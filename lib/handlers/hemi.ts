@@ -1063,11 +1063,31 @@ export async function handleHemiDeviceRelease(
 
   const { data: device } = await posDb
     .from('store_devices')
-    .select('id, device_sn, owner_user_id')
+    .select('id, device_sn, owner_user_id, owner_store_id')
     .eq('device_sn', deviceSn)
     .maybeSingle();
   if (!device) return res.status(404).json({ error: 'device_not_found' });
-  if (device.owner_user_id !== userId) return res.status(403).json({ error: 'not_your_device' });
+
+  // Authorize disconnect:
+  //   single-user device → caller must be owner_user_id
+  //   org device         → caller must be the store's owner (stores.merchant_id).
+  //                        Managers/cashiers cannot disconnect — they can only
+  //                        sign out of their own session via /sign-out.
+  if ((device as any).owner_store_id) {
+    const { data: store } = await posDb
+      .from('stores')
+      .select('merchant_id')
+      .eq('id', (device as any).owner_store_id)
+      .maybeSingle();
+    if (!store || (store as any).merchant_id !== userId) {
+      return res.status(403).json({
+        error: 'not_store_owner',
+        message: 'Only the store owner can disconnect this terminal. Cashiers should sign out instead.',
+      });
+    }
+  } else if (device.owner_user_id !== userId) {
+    return res.status(403).json({ error: 'not_your_device' });
+  }
 
   // Close any open shift on this device (pump operator handoff, etc.)
   await posDb
@@ -1095,11 +1115,13 @@ export async function handleHemiDeviceRelease(
     .eq('device_sn', deviceSn)
     .neq('status', 'archived');
 
-  // Un-claim
+  // Un-claim — clear both ownership forms + the operating session.
   const { data: updated, error: updErr } = await posDb
     .from('store_devices')
     .update({
       owner_user_id: null,
+      owner_store_id: null,
+      claimed_by_user_id: null,
       claimed_at: null,
       terminal_label: null,
       profile: 'merchant',
@@ -1158,6 +1180,244 @@ export async function handleHemiDeviceRelease(
     amount: 0,
     orderId: `release_${Date.now()}`,
   }).catch(err => console.warn('[HEMI release] dismiss wait-payment failed:', err?.message));
+
+  return res.status(200).json({ ok: true });
+}
+
+// ─── Charge endpoint — POS plugin push-to-device ──────────────────────
+//
+// Called by peeap-pos when a vendor cashier taps "Charge" on a cart.
+// The vendor's marketplace dashboard sends:
+//   { device_sn, amount, order_id, line_items?, store_id }
+// authenticated with SERVICE_SECRET.
+//
+// We:
+//   1. Verify the device belongs to the calling store
+//   2. Create a checkout session row in Card.checkout_sessions
+//   3. Paint the wait-payment screen on the device with the session URL
+//   4. Return { session_id, scan_url } for peeap-pos to poll/show
+//
+// The customer scans the device's QR with their Peeap app → lands on
+// /scan-pay/:sessionId → pays from wallet → wallet xfer to vendor
+// merchant_id → webhook fires back to peeap-pos to mark order paid.
+//
+// Why this lives in Terminal (not Card or peeap-pos): the device-paint
+// is what's unique here. Checkout sessions and wallet xfers are Card
+// concerns; we delegate by inserting into Card's table directly. Same
+// pattern as the keypad-inbound flow.
+export async function handleCheckoutPushToDevice(
+  req: VercelRequest,
+  res: VercelResponse,
+) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  const serviceSecret = (req.headers['x-service-secret'] || req.headers['x-Service-Secret']) as string | undefined;
+  if (!serviceSecret || serviceSecret !== process.env.SERVICE_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const { device_sn, amount, order_id, line_items, store_id, return_url } = (req.body || {}) as {
+    device_sn?: string;
+    amount?: number;
+    order_id?: string;
+    line_items?: Array<{ name: string; quantity: number; price: number }>;
+    store_id?: string;
+    return_url?: string;
+  };
+
+  if (!device_sn || typeof amount !== 'number' || amount <= 0 || !order_id || !store_id) {
+    return res.status(400).json({ error: 'invalid_payload' });
+  }
+
+  // Verify device belongs to this store. Stops a compromised peeap-pos
+  // (or a misconfigured cross-service caller) from painting amounts on
+  // someone else's terminal.
+  const { data: device } = await posDb
+    .from('store_devices')
+    .select('id, device_sn, owner_store_id, status, profile')
+    .eq('device_sn', device_sn)
+    .maybeSingle();
+  if (!device || (device as any).status !== 'active') {
+    return res.status(404).json({ error: 'device_not_found_or_disabled' });
+  }
+  if ((device as any).owner_store_id !== store_id) {
+    return res.status(403).json({ error: 'device_not_owned_by_store' });
+  }
+  if ((device as any).profile === 'event_gate') {
+    return res.status(409).json({
+      error: 'device_in_event_gate_mode',
+      message: 'This terminal is bound to an event. Switch it back to merchant/POS mode before charging.',
+    });
+  }
+
+  // Look up the store so we know who the wallet credit goes to.
+  const { data: store } = await posDb
+    .from('stores')
+    .select('id, name, merchant_id')
+    .eq('id', store_id)
+    .maybeSingle();
+  if (!store) return res.status(404).json({ error: 'store_not_found' });
+
+  const sessionId = randomUUID();
+  const expiresAt = new Date(Date.now() + 15 * 60_000).toISOString(); // 15 min
+
+  // Insert checkout session in Card. The /scan-pay/:sessionId page in
+  // apps/web reads from this table.
+  const { error: csErr } = await supabase
+    .from('checkout_sessions')
+    .insert({
+      id: sessionId,
+      external_id: order_id,
+      merchant_id: (store as any).merchant_id,
+      amount,
+      currency: 'SLE',
+      status: 'pending',
+      source: 'pos_plugin',
+      device_sn,
+      metadata: {
+        store_id,
+        store_name: (store as any).name,
+        line_items: line_items || null,
+        return_url: return_url || null,
+      },
+      expires_at: expiresAt,
+    });
+
+  if (csErr) {
+    console.error('[push-to-device] checkout_session insert failed:', csErr);
+    return res.status(500).json({ error: csErr.message || 'session_create_failed' });
+  }
+
+  const scanUrl = `${FRONTEND_URL}/scan-pay/${sessionId}`;
+
+  // Paint the device's wait-payment screen with the amount + QR. Default
+  // 3-min timeout matches the keypad flow; cashier can cancel via
+  // cancel-on-device endpoint if customer changes their mind.
+  setQrCodeData({
+    deviceSn: device_sn,
+    amountDue: amount,
+    orderId: order_id,
+    qrText: scanUrl,
+    amountLabel: ((store as any).name || 'Pay').slice(0, 20),
+  }).catch(err => console.warn('[push-to-device] paint failed:', err?.message));
+
+  return res.status(200).json({
+    ok: true,
+    session_id: sessionId,
+    scan_url: scanUrl,
+    expires_at: expiresAt,
+  });
+}
+
+// ─── Cancel pushed charge — dismiss wait-payment + void session ────────
+export async function handleCheckoutCancelOnDevice(
+  req: VercelRequest,
+  res: VercelResponse,
+) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  const serviceSecret = req.headers['x-service-secret'] as string | undefined;
+  if (!serviceSecret || serviceSecret !== process.env.SERVICE_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const { session_id, store_id } = (req.body || {}) as { session_id?: string; store_id?: string };
+  if (!session_id || !store_id) return res.status(400).json({ error: 'invalid_payload' });
+
+  const { data: session } = await supabase
+    .from('checkout_sessions')
+    .select('id, device_sn, status, metadata')
+    .eq('id', session_id)
+    .maybeSingle();
+  if (!session) return res.status(404).json({ error: 'session_not_found' });
+  if ((session as any).status !== 'pending') {
+    return res.status(409).json({ error: 'session_not_pending' });
+  }
+  // Lock to the calling store so a vendor can't cancel another vendor's
+  // session.
+  const meta = (session as any).metadata || {};
+  if (meta.store_id !== store_id) {
+    return res.status(403).json({ error: 'not_your_session' });
+  }
+
+  await supabase
+    .from('checkout_sessions')
+    .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .eq('id', session_id);
+
+  // Dismiss the wait-payment screen on the device.
+  const sn = (session as any).device_sn;
+  if (sn) {
+    setPaymentResult({
+      deviceSn: sn,
+      amount: 0,
+      orderId: `cancel_${Date.now()}`,
+    }).catch(() => {});
+  }
+
+  return res.status(200).json({ ok: true });
+}
+
+// ─── Sign out — org-device staff session end ──────────────────────────
+//
+// Distinct from /release (Disconnect):
+//   - sign-out keeps owner_store_id intact; only ends the caller's
+//     operating session by clearing claimed_by_user_id and closing the
+//     open shift. Available to any approved staff currently signed in.
+//   - release fully un-pairs the device. Owner-only on org devices.
+//
+// Result on the device: the brand-overlay merchant_idle screen stays.
+// The next approved cashier can scan and claim instantly without an
+// admin in between.
+//
+// 405 if called on a single-user device — those have no concept of
+// "sign out without disconnecting"; the merchant just hits Disconnect.
+export async function handleHemiDeviceSignOut(
+  req: VercelRequest,
+  res: VercelResponse,
+  deviceSn: string,
+) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+  const userId = await getAuthenticatedUserId(req);
+  if (!userId) return res.status(401).json({ error: 'unauthorized' });
+
+  const { data: device } = await posDb
+    .from('store_devices')
+    .select('id, device_sn, owner_user_id, owner_store_id, claimed_by_user_id')
+    .eq('device_sn', deviceSn)
+    .maybeSingle();
+  if (!device) return res.status(404).json({ error: 'device_not_found' });
+
+  if (!(device as any).owner_store_id) {
+    return res.status(400).json({
+      error: 'not_an_org_device',
+      message: 'Sign-out is only for organisation devices. For your personal terminal, use Disconnect.',
+    });
+  }
+
+  // Only the staff currently holding the session can sign out (or no
+  // active session at all, in which case we no-op gracefully).
+  const currentStaff = (device as any).claimed_by_user_id;
+  if (currentStaff && currentStaff !== userId) {
+    return res.status(403).json({
+      error: 'not_your_session',
+      message: 'Another staff member is signed in on this terminal.',
+    });
+  }
+
+  const nowIso = new Date().toISOString();
+
+  await posDb
+    .from('store_device_shifts')
+    .update({ ended_at: nowIso, metadata: { closed_via: 'staff_sign_out' } })
+    .eq('device_sn', deviceSn)
+    .eq('staff_user_id', userId)
+    .is('ended_at', null);
+
+  await posDb
+    .from('store_devices')
+    .update({ claimed_by_user_id: null, updated_at: nowIso })
+    .eq('id', (device as any).id);
 
   return res.status(200).json({ ok: true });
 }
@@ -2401,26 +2661,48 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
       .select('id, first_name, last_name, phone, email, kyc_status, kyc_tier, created_at')
       .eq('id', userId)
       .single();
+    const dossier = {
+      device_sn: device.device_sn,
+      claimer_user_id: userId,
+      claimer_phone: claimer?.phone,
+      claimer_name: claimer ? `${claimer.first_name || ''} ${claimer.last_name || ''}`.trim() : null,
+      claimer_email: claimer?.email,
+      claimer_kyc: { status: claimer?.kyc_status, tier: claimer?.kyc_tier },
+      claimer_account_age_days: claimer?.created_at
+        ? Math.floor((Date.now() - new Date(claimer.created_at).getTime()) / 86400000)
+        : null,
+      claimer_ip: claimerIp,
+      claimer_user_agent: claimerUa,
+      original_owner_user_id: reportedStolenBy,
+    };
     void logAlert(
       'critical',
       'hemi_theft_honeypot',
       'stolen_device_claimed',
       `Stolen device ${device.device_sn} was claimed — capture identity for investigation`,
-      {
-        device_sn: device.device_sn,
-        claimer_user_id: userId,
-        claimer_phone: claimer?.phone,
-        claimer_name: claimer ? `${claimer.first_name || ''} ${claimer.last_name || ''}`.trim() : null,
-        claimer_email: claimer?.email,
-        claimer_kyc: { status: claimer?.kyc_status, tier: claimer?.kyc_tier },
-        claimer_account_age_days: claimer?.created_at
-          ? Math.floor((Date.now() - new Date(claimer.created_at).getTime()) / 86400000)
-          : null,
-        claimer_ip: claimerIp,
-        claimer_user_agent: claimerUa,
-        original_owner_user_id: reportedStolenBy,
-      },
+      dossier,
     );
+    // Wallet freeze — outgoing transfers / payouts / payments blocked
+    // for this user until support clears the freeze after an in-person
+    // verification. Incoming credits keep working so we don't lose
+    // visibility on subsequent activity from the suspected thief.
+    void supabase.from('wallet_freezes').insert({
+      user_id: userId,
+      reason: 'stolen_device_claim',
+      reason_ref: device.device_sn,
+      status: 'active',
+      evidence_json: dossier,
+    });
+    // Notify the claimer so they know they need to walk in to a Peeap
+    // office. We deliberately don't say "we caught you" — keep the
+    // wording neutral so they show up to argue rather than disappear.
+    void supabase.from('notifications').insert({
+      user_id: userId,
+      type: 'wallet_review_required',
+      title: 'Account under review',
+      message: 'Your account has been flagged for review. Outgoing transfers are paused. Please visit a Peeap office with valid ID to resolve.',
+      data: { freeze_reason: 'stolen_device_claim' },
+    });
     // Notify the original owner that their stolen device just resurfaced.
     if (reportedStolenBy) {
       void supabase.from('notifications').insert({

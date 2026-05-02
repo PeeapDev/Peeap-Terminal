@@ -54,6 +54,9 @@ import {
   handleHemiDeviceRelease,
   handleHemiDeviceFactoryReset,
   handleHemiDeviceReportStolen,
+  handleHemiDeviceSignOut,
+  handleCheckoutPushToDevice,
+  handleCheckoutCancelOnDevice,
   handleHemiDeviceEndShift,
   handleHemiDeviceBindEvent,
   handleHemiMyEvents,
@@ -258,6 +261,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return await handleEventGateVerify(req, res);
     }
 
+    // ── POS plugin: vendor → Terminal cross-service charge ─────────────
+    // Auth: SERVICE_SECRET. Called from peeap-pos when a cashier taps
+    // Charge on a cart. Paints amount + checkout-session QR on the
+    // bound device.
+    if (path === 'checkout/push-to-device') {
+      return await handleCheckoutPushToDevice(req, res);
+    }
+    if (path === 'checkout/cancel-on-device') {
+      return await handleCheckoutCancelOnDevice(req, res);
+    }
+
     // ── HEMI device lifecycle ──────────────────────────────────────────
     if (path === 'hemi/devices/register') {
       return await handleHemiDeviceRegister(req, res);
@@ -286,6 +300,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       switch (sub) {
         case 'release':
           return await handleHemiDeviceRelease(req, res, sn);
+        case 'sign-out':
+          return await handleHemiDeviceSignOut(req, res, sn);
         case 'factory-reset':
           return await handleHemiDeviceFactoryReset(req, res, sn);
         case 'report-stolen':
