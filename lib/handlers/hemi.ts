@@ -754,8 +754,11 @@ export async function handleHemiDeviceList(req: VercelRequest, res: VercelRespon
   const url = new URL(req.url || '', `https://${req.headers.host}`);
   const wantLive = url.searchParams.get('live') === '1';
 
-  const dbPromise = supabase
-    .from('merchant_devices')
+  // Phase C: read from POS Supabase (store_devices). User auth is still
+  // validated via Card (sso_tokens), but device-side data lives in POS.
+  const { posDb } = await import('../_shared');
+  const dbPromise = posDb
+    .from('store_devices')
     .select('id, device_sn, model, profile, terminal_label, status, last_seen_at, last_synced_at, cloud_state, created_at')
     .eq('owner_user_id', userId)
     .order('created_at', { ascending: false });
@@ -820,8 +823,8 @@ export async function handleHemiDeviceList(req: VercelRequest, res: VercelRespon
   // Fire-and-forget — the response doesn't depend on this finishing.
   if (persistRows.length > 0) {
     Promise.all(persistRows.map(p =>
-      supabase
-        .from('merchant_devices')
+      posDb
+        .from('store_devices')
         .update({
           cloud_state: p.cloud_state,
           last_synced_at: p.last_synced_at,
