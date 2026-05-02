@@ -29,6 +29,7 @@ import {
   getAuthenticatedUserId,
   logAlert,
   getClientIp,
+  posDb,
 } from '../_shared';
 import { sendManualMessage, setPaymentResult } from './hemi';
 
@@ -206,8 +207,8 @@ async function playGateAudio(
 ): Promise<void> {
   if (!merchantUserId) return;
   try {
-    const { data: asset } = await supabase
-      .from('merchant_terminal_assets')
+    const { data: asset } = await posDb
+      .from('store_terminal_assets')
       .select('cloud_speaker_filename')
       .eq('merchant_user_id', merchantUserId)
       .eq('asset_type', 'audio')

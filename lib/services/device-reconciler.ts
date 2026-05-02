@@ -27,7 +27,7 @@
  * handler audit.
  */
 
-import { supabase } from '../_shared';
+import { supabase, posDb } from '../_shared';
 import {
   updateHomeScreen,
   setQrCodeData,
@@ -54,8 +54,8 @@ export interface ReconcileResult {
  * Pure function — no side effects, easy to test.
  */
 async function computeTargetState(deviceSn: string): Promise<DeviceTargetState | null> {
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('owner_user_id, profile, terminal_label, status')
     .eq('device_sn', deviceSn)
     .maybeSingle();
@@ -242,8 +242,8 @@ export async function reconcileAllOnlineDevices(): Promise<{
   // limit to claimed-OR-recently-seen so we don't hammer cloud-speaker
   // every 5 min on inventory we haven't shipped.
   const cutoff = new Date(Date.now() - 30 * 60_000).toISOString();
-  const { data: devices } = await supabase
-    .from('merchant_devices')
+  const { data: devices } = await posDb
+    .from('store_devices')
     .select('device_sn, last_seen_at')
     .gte('last_seen_at', cutoff);
 

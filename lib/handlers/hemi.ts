@@ -33,6 +33,7 @@ import {
   supabase,
   getAuthenticatedUserId,
   logAlert,
+  posDb,
 } from '../_shared';
 
 // `vercel env add` via shell pipe historically appends a trailing newline,
@@ -254,8 +255,8 @@ export async function announceIfDeviceSession(session: any, paidAmount: number):
     // session metadata doesn't carry profile, so a quick DB read is the
     // only reliable source. Falls back to standard payment audio if the
     // row is missing.
-    const { data: device } = await supabase
-      .from('merchant_devices')
+    const { data: device } = await posDb
+      .from('store_devices')
       .select('profile, owner_user_id')
       .eq('device_sn', deviceSn)
       .maybeSingle();
@@ -265,8 +266,8 @@ export async function announceIfDeviceSession(session: any, paidAmount: number):
       // merchant has uploaded one. Falls back to silence — events
       // depend on fast scanning and the Peeap app already shows the
       // attendee a visual confirmation.
-      const { data: validAudio } = await supabase
-        .from('merchant_terminal_assets')
+      const { data: validAudio } = await posDb
+        .from('store_terminal_assets')
         .select('cloud_speaker_filename')
         .eq('merchant_user_id', device.owner_user_id)
         .eq('asset_type', 'audio')
@@ -429,8 +430,8 @@ export async function handleHemiAdminCommand(req: VercelRequest, res: VercelResp
   // Verify device exists in our DB to prevent admins from poking arbitrary
   // SNs that aren't ours. Skip the in-cloud check — admin may want to test
   // a freshly-added device that hasn't been synced yet.
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('device_sn, status')
     .eq('device_sn', device_sn)
     .maybeSingle();
@@ -547,15 +548,15 @@ export async function handleHemiKeypadInbound(
 
   waitUntil((async () => {
     try {
-      let { data: device } = await supabase
-        .from('merchant_devices')
+      let { data: device } = await posDb
+        .from('store_devices')
         .select('id, device_sn, owner_user_id, status, terminal_label, claimed_at, profile')
         .eq('device_sn', deviceNumber)
         .maybeSingle();
 
       if (!device) {
-        const { data: created } = await supabase
-          .from('merchant_devices')
+        const { data: created } = await posDb
+          .from('store_devices')
           .insert({
             device_sn: deviceNumber,
             device_secret: randomBytes(24).toString('base64url'),
@@ -607,8 +608,8 @@ export async function handleHemiKeypadInbound(
           .select('id, first_name, last_name, username, profile_picture')
           .eq('id', device.owner_user_id)
           .single(),
-        supabase
-          .from('device_shifts')
+        posDb
+          .from('store_device_shifts')
           .select('id, staff_user_id')
           .eq('device_sn', device.device_sn)
           .is('ended_at', null)
@@ -619,8 +620,8 @@ export async function handleHemiKeypadInbound(
         ? `${owner.first_name || ''} ${owner.last_name || ''}`.trim() || owner.username || 'Merchant'
         : 'Merchant';
 
-      supabase
-        .from('merchant_devices')
+      posDb
+        .from('store_devices')
         .update({ last_seen_at: new Date().toISOString() })
         .eq('id', device.id)
         .then(() => {});
@@ -707,8 +708,8 @@ export async function handleHemiDeviceRegister(req: VercelRequest, res: VercelRe
 
   const deviceSecret = randomBytes(24).toString('base64url');
 
-  const { data, error } = await supabase
-    .from('merchant_devices')
+  const { data, error } = await posDb
+    .from('store_devices')
     .insert({
       device_sn,
       device_secret: deviceSecret,
@@ -756,7 +757,6 @@ export async function handleHemiDeviceList(req: VercelRequest, res: VercelRespon
 
   // Phase C: read from POS Supabase (store_devices). User auth is still
   // validated via Card (sso_tokens), but device-side data lives in POS.
-  const { posDb } = await import('../_shared');
   const dbPromise = posDb
     .from('store_devices')
     .select('id, device_sn, model, profile, terminal_label, status, last_seen_at, last_synced_at, cloud_state, created_at')
@@ -861,8 +861,8 @@ export async function handleHemiDeviceAudioUpload(
   const userId = await getAuthenticatedUserId(req);
   if (!userId) return res.status(401).json({ error: 'unauthorized' });
 
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('owner_user_id, status, cloud_state')
     .eq('device_sn', deviceSn)
     .maybeSingle();
@@ -912,8 +912,8 @@ export async function handleHemiDeviceAudioUpload(
   // Record a pending asset row so admin can review before merchant can
   // activate. cloud_speaker_filename is the actual stored name HEMI used.
   const csFilename = `usa_eng_${safeName}`;
-  const { data: asset } = await supabase
-    .from('merchant_terminal_assets')
+  const { data: asset } = await posDb
+    .from('store_terminal_assets')
     .insert({
       merchant_user_id: userId,
       device_sn: deviceSn,
@@ -949,8 +949,8 @@ export async function handleHemiMerchantAssetList(req: VercelRequest, res: Verce
   const deviceSn = url.searchParams.get('device_sn') || null;
   const assetType = url.searchParams.get('type') || null;
 
-  let q = supabase
-    .from('merchant_terminal_assets')
+  let q = posDb
+    .from('store_terminal_assets')
     .select('id, device_sn, asset_type, display_name, mime_type, size_bytes, cloud_speaker_filename, status, rejection_reason, submitted_at, reviewed_at')
     .eq('merchant_user_id', userId)
     .order('submitted_at', { ascending: false });
@@ -976,8 +976,8 @@ export async function handleHemiAdminAssetQueue(req: VercelRequest, res: VercelR
   const url = new URL(req.url || '', `https://${req.headers.host}`);
   const status = url.searchParams.get('status') || 'pending';
 
-  const { data, error } = await supabase
-    .from('merchant_terminal_assets')
+  const { data, error } = await posDb
+    .from('store_terminal_assets')
     .select(`
       id, merchant_user_id, device_sn, asset_type, display_name,
       original_filename, mime_type, size_bytes, cloud_speaker_filename,
@@ -1020,8 +1020,8 @@ export async function handleHemiAdminAssetReview(
   };
   if (decision === 'reject') update.rejection_reason = reason;
 
-  const { data, error } = await supabase
-    .from('merchant_terminal_assets')
+  const { data, error } = await posDb
+    .from('store_terminal_assets')
     .update(update)
     .eq('id', assetId)
     .select('id, status, rejection_reason, reviewed_at')
@@ -1061,8 +1061,8 @@ export async function handleHemiDeviceRelease(
   const userId = await getAuthenticatedUserId(req);
   if (!userId) return res.status(401).json({ error: 'unauthorized' });
 
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('id, device_sn, owner_user_id')
     .eq('device_sn', deviceSn)
     .maybeSingle();
@@ -1070,8 +1070,8 @@ export async function handleHemiDeviceRelease(
   if (device.owner_user_id !== userId) return res.status(403).json({ error: 'not_your_device' });
 
   // Close any open shift on this device (pump operator handoff, etc.)
-  await supabase
-    .from('device_shifts')
+  await posDb
+    .from('store_device_shifts')
     .update({ ended_at: new Date().toISOString(), metadata: { closed_via: 'owner_release' } })
     .eq('device_sn', deviceSn)
     .is('ended_at', null);
@@ -1088,16 +1088,16 @@ export async function handleHemiDeviceRelease(
 
   // Archive personalization — clears the merchant's audio bank entries so
   // the next owner doesn't inherit them.
-  await supabase
-    .from('merchant_terminal_assets')
+  await posDb
+    .from('store_terminal_assets')
     .update({ status: 'archived' })
     .eq('merchant_user_id', userId)
     .eq('device_sn', deviceSn)
     .neq('status', 'archived');
 
   // Un-claim
-  const { data: updated, error: updErr } = await supabase
-    .from('merchant_devices')
+  const { data: updated, error: updErr } = await posDb
+    .from('store_devices')
     .update({
       owner_user_id: null,
       claimed_at: null,
@@ -1184,8 +1184,8 @@ export async function handleHemiDeviceFactoryReset(
   const userId = await getAuthenticatedUserId(req);
   if (!userId) return res.status(401).json({ error: 'unauthorized' });
 
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('owner_user_id, status')
     .eq('device_sn', deviceSn)
     .maybeSingle();
@@ -1230,8 +1230,8 @@ export async function handleHemiDeviceReportStolen(
   const userId = await getAuthenticatedUserId(req);
   if (!userId) return res.status(401).json({ error: 'unauthorized' });
 
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('id, device_sn, owner_user_id, terminal_label, security_flag')
     .eq('device_sn', deviceSn)
     .maybeSingle();
@@ -1240,14 +1240,14 @@ export async function handleHemiDeviceReportStolen(
 
   // Close any open shift on the device — staff in the field have nothing
   // useful to do with a reported-stolen device.
-  await supabase
-    .from('device_shifts')
+  await posDb
+    .from('store_device_shifts')
     .update({ ended_at: new Date().toISOString(), metadata: { closed_via: 'theft_report' } })
     .eq('device_sn', deviceSn)
     .is('ended_at', null);
 
-  const { error } = await supabase
-    .from('merchant_devices')
+  const { error } = await posDb
+    .from('store_devices')
     .update({
       security_flag: 'reported_stolen',
       reported_stolen_at: new Date().toISOString(),
@@ -1294,8 +1294,8 @@ export async function handleHemiDeviceEndShift(
   const userId = await getAuthenticatedUserId(req);
   if (!userId) return res.status(401).json({ error: 'unauthorized' });
 
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('owner_user_id, terminal_label')
     .eq('device_sn', deviceSn)
     .maybeSingle();
@@ -1304,8 +1304,8 @@ export async function handleHemiDeviceEndShift(
 
   const { cash_collected } = (req.body || {}) as { cash_collected?: number };
 
-  const { data: ended, error } = await supabase
-    .from('device_shifts')
+  const { data: ended, error } = await posDb
+    .from('store_device_shifts')
     .update({
       ended_at: new Date().toISOString(),
       cash_collected: typeof cash_collected === 'number' ? cash_collected : null,
@@ -1337,8 +1337,8 @@ export async function handleHemiDeviceEndShift(
 // freshness signal. Realtime then pushes to all open merchant pages.
 async function bumpLiveStateAfterCommand(deviceSn: string) {
   const now = new Date();
-  const { data: cur } = await supabase
-    .from('merchant_devices')
+  const { data: cur } = await posDb
+    .from('store_devices')
     .select('cloud_state')
     .eq('device_sn', deviceSn)
     .maybeSingle();
@@ -1347,8 +1347,8 @@ async function bumpLiveStateAfterCommand(deviceSn: string) {
     networkStatus: 1,
     lastReportAt: now.getTime(),
   };
-  await supabase
-    .from('merchant_devices')
+  await posDb
+    .from('store_devices')
     .update({
       cloud_state: next,
       last_seen_at: now.toISOString(),
@@ -1372,8 +1372,8 @@ export async function handleHemiDeviceBindEvent(
   const { event_id } = (req.body || {}) as { event_id?: string | null };
 
   // Ownership check on device
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('owner_user_id, terminal_label')
     .eq('device_sn', deviceSn)
     .maybeSingle();
@@ -1503,8 +1503,8 @@ export async function handleCronHemiPing(req: VercelRequest, res: VercelResponse
   }
 
   // Pull current rows so we can preserve fields cloud-speaker doesn't return.
-  const { data: existing } = await supabase
-    .from('merchant_devices')
+  const { data: existing } = await posDb
+    .from('store_devices')
     .select('id, device_sn, cloud_state, status, owner_user_id, claimed_at');
   const existingBySn = new Map((existing || []).map(r => [r.device_sn, r]));
 
@@ -1550,7 +1550,7 @@ export async function handleCronHemiPing(req: VercelRequest, res: VercelResponse
   // it is. Realtime fires once per row.
   const writeStart = Date.now();
   await Promise.all(updates.map(u =>
-    supabase.from('merchant_devices').update(u.payload).eq('device_sn', u.device_sn).then(() => {}),
+    posDb.from('store_devices').update(u.payload).eq('device_sn', u.device_sn).then(() => {}),
   ));
 
   // Self-heal: bring every online device's screen into agreement with
@@ -1611,8 +1611,8 @@ export async function handleHemiDeviceAction(
   if (!userId) return res.status(401).json({ error: 'unauthorized' });
 
   // Owner-only — fail fast before any HEMI call.
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('id, device_sn, owner_user_id, status, terminal_label')
     .eq('device_sn', deviceSn)
     .maybeSingle();
@@ -1673,8 +1673,8 @@ export async function handleHemiDeviceAction(
     // Approval gate: only clips the merchant has uploaded AND admin has
     // approved can be activated. Prevents bypass of the review queue
     // (e.g. "payment failed" audio after a successful payment).
-    const { data: asset } = await supabase
-      .from('merchant_terminal_assets')
+    const { data: asset } = await posDb
+      .from('store_terminal_assets')
       .select('id, status, merchant_user_id')
       .eq('cloud_speaker_filename', filename)
       .eq('merchant_user_id', userId)
@@ -1711,8 +1711,8 @@ export async function handleHemiDeviceAction(
     // Apply the same overlay logic as ?live=1 so signal/network/battery
     // get refreshed alongside last_seen.
     const isWifi = (csRow.network_mode || '').toUpperCase() === 'WIFI';
-    const { data: cur } = await supabase
-      .from('merchant_devices')
+    const { data: cur } = await posDb
+      .from('store_devices')
       .select('cloud_state')
       .eq('device_sn', deviceSn)
       .maybeSingle();
@@ -1730,8 +1730,8 @@ export async function handleHemiDeviceAction(
       lastReportAt: csRow.lastReportDataTime,
       ip: csRow.ip,
     };
-    await supabase
-      .from('merchant_devices')
+    await posDb
+      .from('store_devices')
       .update({
         cloud_state: cloudState,
         last_synced_at: new Date().toISOString(),
@@ -1783,8 +1783,8 @@ export async function handleHemiDeviceAction(
       cloudId: csRow.id,
       ownerName: csRow.ownerName,
     };
-    await supabase
-      .from('merchant_devices')
+    await posDb
+      .from('store_devices')
       .update({
         cloud_state: cloudState,
         last_synced_at: new Date().toISOString(),
@@ -1822,8 +1822,8 @@ export async function handleHemiDeviceUpdate(
   };
 
   // Verify ownership before any update
-  const { data: existing } = await supabase
-    .from('merchant_devices')
+  const { data: existing } = await posDb
+    .from('store_devices')
     .select('owner_user_id, status, profile')
     .eq('device_sn', deviceSn)
     .maybeSingle();
@@ -1848,8 +1848,8 @@ export async function handleHemiDeviceUpdate(
   if (terminal_label !== undefined) updates.terminal_label = terminal_label || null;
   if (status !== undefined) updates.status = status;
 
-  const { data: updated, error: updErr } = await supabase
-    .from('merchant_devices')
+  const { data: updated, error: updErr } = await posDb
+    .from('store_devices')
     .update(updates)
     .eq('device_sn', deviceSn)
     .eq('owner_user_id', userId)
@@ -1947,8 +1947,8 @@ export async function handleHemiShiftStart(req: VercelRequest, res: VercelRespon
 
   // Device must exist + be active (any owner — staff don't have to belong
   // to the owner table; the unique-open-shift constraint covers handoff).
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('device_sn, status')
     .eq('device_sn', device_sn)
     .single();
@@ -1958,14 +1958,14 @@ export async function handleHemiShiftStart(req: VercelRequest, res: VercelRespon
   }
 
   // Auto-close any prior open shift on this device.
-  await supabase
-    .from('device_shifts')
+  await posDb
+    .from('store_device_shifts')
     .update({ ended_at: new Date().toISOString(), metadata: { closed_via: 'auto_handoff' } })
     .eq('device_sn', device_sn)
     .is('ended_at', null);
 
-  const { data: shift, error } = await supabase
-    .from('device_shifts')
+  const { data: shift, error } = await posDb
+    .from('store_device_shifts')
     .insert({
       device_sn,
       staff_user_id: userId,
@@ -1992,8 +1992,8 @@ export async function handleHemiShiftEnd(req: VercelRequest, res: VercelResponse
   };
   if (!device_sn) return res.status(400).json({ error: 'device_sn_required' });
 
-  const { data, error } = await supabase
-    .from('device_shifts')
+  const { data, error } = await posDb
+    .from('store_device_shifts')
     .update({
       ended_at: new Date().toISOString(),
       cash_collected: typeof cash_collected === 'number' ? cash_collected : null,
@@ -2042,8 +2042,8 @@ export async function handleHemiBulkProvision(req: VercelRequest, res: VercelRes
     status: 'active',
   }));
 
-  const { data, error } = await supabase
-    .from('merchant_devices')
+  const { data, error } = await posDb
+    .from('store_devices')
     .insert(rows)
     .select('device_sn, device_secret');
 
@@ -2080,8 +2080,8 @@ export async function handleHemiDeviceClaim(
     return res.status(404).json({ error: 'not_found' });
   }
 
-  const { data: device, error: devErr } = await supabase
-    .from('merchant_devices')
+  const { data: device, error: devErr } = await posDb
+    .from('store_devices')
     .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id')
     .eq('device_secret', deviceSecret)
     .maybeSingle();
@@ -2120,8 +2120,8 @@ export async function handleHemiDeviceClaim(
     terminal_label?: string;
   };
 
-  const { data: claimed, error: updErr } = await supabase
-    .from('merchant_devices')
+  const { data: claimed, error: updErr } = await posDb
+    .from('store_devices')
     .update({
       owner_user_id: userId,
       claimed_at: new Date().toISOString(),
@@ -2180,8 +2180,8 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
   // PG 42703 and the API returns device_not_in_inventory falsely. We
   // load the security fields in a separate try-catch below so the
   // claim flow keeps working in either schema state.
-  let { data: device, error: devErr } = await supabase
-    .from('merchant_devices')
+  let { data: device, error: devErr } = await posDb
+    .from('store_devices')
     .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id')
     .eq('device_sn', sn)
     .maybeSingle();
@@ -2198,8 +2198,8 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
       ? csList.devices.find((d: any) => d?.deviceNumber === sn)
       : undefined;
     if (csRow) {
-      const { data: imported, error: importErr } = await supabase
-        .from('merchant_devices')
+      const { data: imported, error: importErr } = await posDb
+        .from('store_devices')
         .insert({
           device_sn: sn,
           device_secret: randomBytes(24).toString('base64url'),
@@ -2238,8 +2238,8 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
   let securityFlag: string | null = null;
   let reportedStolenBy: string | null = null;
   try {
-    const { data: sec } = await supabase
-      .from('merchant_devices')
+    const { data: sec } = await posDb
+      .from('store_devices')
       .select('security_flag, reported_stolen_by' as any)
       .eq('id', device.id)
       .maybeSingle();
@@ -2279,8 +2279,8 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
     terminal_label?: string;
   };
 
-  const { data: claimed, error: updErr } = await supabase
-    .from('merchant_devices')
+  const { data: claimed, error: updErr } = await posDb
+    .from('store_devices')
     .update({
       owner_user_id: userId,
       claimed_at: new Date().toISOString(),
@@ -2390,8 +2390,8 @@ export async function handleHemiPushClaimScreen(req: VercelRequest, res: VercelR
   const { device_sn } = (req.body || {}) as { device_sn?: string };
   if (!device_sn) return res.status(400).json({ error: 'device_sn_required' });
 
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('device_sn, claimed_at')
     .eq('device_sn', device_sn)
     .maybeSingle();
@@ -2415,8 +2415,8 @@ export async function handleHemiAdminDeviceList(req: VercelRequest, res: VercelR
     return res.status(403).json({ error: 'admin_only' });
   }
 
-  const { data: devices, error } = await supabase
-    .from('merchant_devices')
+  const { data: devices, error } = await posDb
+    .from('store_devices')
     .select(`
       id, device_sn, device_secret, model, profile, terminal_label,
       status, owner_user_id, claimed_at, last_seen_at, last_synced_at,
@@ -2466,8 +2466,8 @@ export async function handleHemiAdminLiveDevices(req: VercelRequest, res: Vercel
   // our DB is fast.
   const [csList, dbResult] = await Promise.all([
     cloudSpeakerListDevices(),
-    supabase
-      .from('merchant_devices')
+    posDb
+      .from('store_devices')
       .select(`
         id, device_sn, device_secret, model, profile, terminal_label,
         status, owner_user_id, claimed_at, last_seen_at, created_at,
@@ -2683,8 +2683,8 @@ export async function handleHemiSync(req: VercelRequest, res: VercelResponse) {
   }
 
   // Existing rows we already have, keyed by SN.
-  const { data: existing } = await supabase
-    .from('merchant_devices')
+  const { data: existing } = await posDb
+    .from('store_devices')
     .select('id, device_sn, claimed_at');
   const existingBySn = new Map((existing || []).map(r => [r.device_sn, r]));
 
@@ -2759,7 +2759,7 @@ export async function handleHemiSync(req: VercelRequest, res: VercelResponse) {
   }
 
   if (newRows.length > 0) {
-    const { error } = await supabase.from('merchant_devices').insert(newRows);
+    const { error } = await posDb.from('store_devices').insert(newRows);
     if (error) {
       console.error('[HEMI] sync insert failed:', error);
       return res.status(500).json({ error: error.message });
@@ -2776,8 +2776,8 @@ export async function handleHemiSync(req: VercelRequest, res: VercelResponse) {
   // because Supabase doesn't support multi-row UPDATEs without an upsert.
   if (updates.length > 0) {
     await Promise.all(updates.map(u =>
-      supabase
-        .from('merchant_devices')
+      posDb
+        .from('store_devices')
         .update({
           cloud_state: u.cloud_state,
           last_synced_at: u.last_synced_at,
@@ -2827,8 +2827,8 @@ export async function handleHemiPushAmount(req: VercelRequest, res: VercelRespon
     return res.status(400).json({ error: 'device_sn_and_amount_required' });
   }
 
-  const { data: device } = await supabase
-    .from('merchant_devices')
+  const { data: device } = await posDb
+    .from('store_devices')
     .select('device_sn, owner_user_id, terminal_label, status, claimed_at')
     .eq('device_sn', device_sn)
     .maybeSingle();
