@@ -33,8 +33,34 @@ if (!supabaseUrl || !supabaseServiceKey || !supabaseAnonKey) {
   );
 }
 
+// Card Supabase — single source of truth for users, sso_tokens, wallets,
+// transactions, notifications, system_alerts. Auth flows query this.
 export const supabase: SupabaseClient = createClient(supabaseUrl, supabaseServiceKey);
 export const supabaseAnon: SupabaseClient = createClient(supabaseUrl, supabaseAnonKey);
+
+// POS Supabase — single source of truth for stores (vendors), products,
+// orders, store_devices, store_device_shifts, store_terminal_assets,
+// store_staff, store_device_security_log. Device-side handlers should
+// read/write here, NOT against `supabase` (which is Card).
+//
+// During the Phase C migration handlers switch over one at a time. A
+// handler that hasn't been migrated still uses `supabase` (Card) — the
+// posDb client just sits unused. Once Phase D copies the data over, all
+// device-side handlers should be using posDb exclusively.
+//
+// If POS_SUPABASE_* env vars aren't set yet, posDb falls back to the
+// Card client so a partially-deployed environment doesn't break (the
+// Phase C handlers checking for posDb !== supabase can detect this and
+// skip the cross-DB query).
+const posSupabaseUrl = (process.env.POS_SUPABASE_URL || '').trim();
+const posSupabaseServiceKey = (process.env.POS_SUPABASE_SERVICE_KEY || '').trim();
+
+export const posDb: SupabaseClient =
+  posSupabaseUrl && posSupabaseServiceKey
+    ? createClient(posSupabaseUrl, posSupabaseServiceKey)
+    : supabase;
+
+export const posDbConfigured = !!(posSupabaseUrl && posSupabaseServiceKey);
 
 /**
  * Authenticate a request and return the user ID. Tries: sso_tokens
