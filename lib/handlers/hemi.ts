@@ -2182,7 +2182,7 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
   // claim flow keeps working in either schema state.
   let { data: device, error: devErr } = await posDb
     .from('store_devices')
-    .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id')
+    .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id, owner_store_id, claimed_by_user_id')
     .eq('device_sn', sn)
     .maybeSingle();
 
@@ -2218,7 +2218,7 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
           },
           last_synced_at: new Date().toISOString(),
         })
-        .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id')
+        .select('id, device_sn, model, profile, terminal_label, status, claimed_at, owner_user_id, owner_store_id, claimed_by_user_id')
         .single();
       if (!importErr && imported) {
         device = imported;
@@ -2254,6 +2254,30 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
     return res.status(403).json({ error: 'device_disabled' });
   }
 
+  // Org-membership check. When a device has owner_store_id, it belongs
+  // to a marketplace vendor — anyone scanning the activation QR who
+  // isn't approved staff of that store is rejected. This is the
+  // anti-internal-fraud guard for supermarket-scale vendors: a staff
+  // member can't claim the device on their personal account to redirect
+  // payments to themselves, and a thief who steals an org device gets
+  // rejected unless they're already in the staff roster.
+  let isOrgStaff = false;
+  let orgStaffRole: string | null = null;
+  if ((device as any).owner_store_id) {
+    const { data: staffRow } = await posDb
+      .from('store_staff')
+      .select('role, status, removed_at')
+      .eq('store_id', (device as any).owner_store_id)
+      .eq('user_id', userId)
+      .is('removed_at', null)
+      .eq('status', 'approved')
+      .maybeSingle();
+    if (staffRow) {
+      isOrgStaff = true;
+      orgStaffRole = (staffRow as any).role;
+    }
+  }
+
   if (req.method === 'GET') {
     return res.status(200).json({
       device: {
@@ -2261,7 +2285,10 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
         model: device.model,
         profile: device.profile,
         already_claimed: !!device.claimed_at,
-        is_yours: device.owner_user_id === userId,
+        is_yours: device.owner_user_id === userId
+          || (device as any).claimed_by_user_id === userId,
+        is_org_device: !!(device as any).owner_store_id,
+        org_staff_role: orgStaffRole,
       },
     });
   }
@@ -2270,7 +2297,37 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  if (device.claimed_at && device.owner_user_id && device.owner_user_id !== userId) {
+  // Two ownership cases:
+  //   Org device   → caller must be approved store_staff. claimed_by_user_id
+  //                  rotates per shift; owner_store_id never changes.
+  //   Single-user  → caller becomes owner_user_id. Already-claimed check
+  //                  rejects a different user trying to take over.
+  const isOrgDevice = !!(device as any).owner_store_id;
+
+  if (isOrgDevice) {
+    if (!isOrgStaff) {
+      return res.status(403).json({
+        error: 'not_authorized_for_org_device',
+        message: 'This terminal belongs to an organisation. Ask a manager to add you as staff before claiming it.',
+      });
+    }
+    // Block if another approved staff currently holds an open shift on
+    // this device. They need to sign out (or have their shift force-ended)
+    // before another cashier takes over.
+    const { data: openShift } = await posDb
+      .from('store_device_shifts')
+      .select('id, staff_user_id')
+      .eq('device_sn', device.device_sn)
+      .is('ended_at', null)
+      .maybeSingle();
+    if (openShift && (openShift as any).staff_user_id !== userId) {
+      return res.status(409).json({
+        error: 'device_in_use',
+        message: 'Another staff member is currently signed in on this terminal. Ask them to sign out first.',
+      });
+    }
+  } else if (device.claimed_at && device.owner_user_id && device.owner_user_id !== userId) {
+    // Single-user device, claimed by someone else.
     return res.status(409).json({ error: 'device_already_claimed' });
   }
 
@@ -2279,15 +2336,23 @@ export async function handleHemiClaimBySn(req: VercelRequest, res: VercelRespons
     terminal_label?: string;
   };
 
+  const updatePayload: Record<string, any> = {
+    claimed_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    ...(profile && { profile }),
+    ...(terminal_label !== undefined && { terminal_label }),
+  };
+  if (isOrgDevice) {
+    // Don't touch owner_store_id — only rotate the active staff session.
+    updatePayload.claimed_by_user_id = userId;
+  } else {
+    // Single-user: caller becomes the owner.
+    updatePayload.owner_user_id = userId;
+  }
+
   const { data: claimed, error: updErr } = await posDb
     .from('store_devices')
-    .update({
-      owner_user_id: userId,
-      claimed_at: new Date().toISOString(),
-      ...(profile && { profile }),
-      ...(terminal_label !== undefined && { terminal_label }),
-      updated_at: new Date().toISOString(),
-    })
+    .update(updatePayload)
     .eq('id', device.id)
     .select('id, device_sn, profile, terminal_label, claimed_at')
     .single();

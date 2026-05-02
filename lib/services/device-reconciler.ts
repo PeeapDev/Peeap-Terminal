@@ -56,7 +56,7 @@ export interface ReconcileResult {
 async function computeTargetState(deviceSn: string): Promise<DeviceTargetState | null> {
   const { data: device } = await posDb
     .from('store_devices')
-    .select('owner_user_id, profile, terminal_label, status')
+    .select('owner_user_id, owner_store_id, profile, terminal_label, status')
     .eq('device_sn', deviceSn)
     .maybeSingle();
 
@@ -67,7 +67,12 @@ async function computeTargetState(deviceSn: string): Promise<DeviceTargetState |
     // can't be confused for an active terminal.
     return { kind: 'unclaimed' };
   }
-  if (!device.owner_user_id) {
+  // Either ownership form counts as "claimed at the business level" — a
+  // multi-staff org device is always merchant_idle when no one's signed
+  // in, since claimed_by_user_id is an operational concept that doesn't
+  // change the painted screen (the reconciler doesn't paint per-staff).
+  const hasOwner = !!(device.owner_user_id || (device as any).owner_store_id);
+  if (!hasOwner) {
     return { kind: 'unclaimed' };
   }
 
