@@ -695,6 +695,16 @@ export async function handleHemiDeviceRegister(req: VercelRequest, res: VercelRe
   const userId = await getAuthenticatedUserId(req);
   if (!userId) return res.status(401).json({ error: 'unauthorized' });
 
+  // Only admins can register new devices into inventory. This prevents a
+  // malicious merchant from claiming a SN that belongs to a different device
+  // batch before the legitimate owner can register it. Merchants claim devices
+  // via /hemi/claim-by-sn (the scan-QR flow) which has its own access controls.
+  const { data: u } = await supabase.from('users').select('roles').eq('id', userId).single();
+  const roles = (u?.roles as string[]) || [];
+  if (!roles.includes('admin') && !roles.includes('superadmin')) {
+    return res.status(403).json({ error: 'admin_only', message: 'Only admins can register devices. Merchants claim devices via the scan-QR flow.' });
+  }
+
   const { device_sn, model, profile, terminal_label } = (req.body || {}) as {
     device_sn?: string;
     model?: string;
@@ -1270,8 +1280,14 @@ export async function handleCheckoutPushToDevice(
       external_id: order_id,
       merchant_id: (store as any).merchant_id,
       amount,
-      currency: 'SLE',
-      status: 'pending',
+      currency_code: 'SLE',
+      status: 'OPEN',
+      description: (store as any).name
+        ? `Payment to ${(store as any).name}`
+        : 'Checkout payment',
+      merchant_name: (store as any).name || 'Merchant',
+      brand_color: '#4F46E5',
+      payment_methods: { qr: true, card: true, mobile: false },
       source: 'pos_plugin',
       device_sn,
       metadata: {
@@ -1316,7 +1332,7 @@ export async function handleCheckoutCancelOnDevice(
 ) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const serviceSecret = req.headers['x-service-secret'] as string | undefined;
+  const serviceSecret = (req.headers['x-service-secret'] || req.headers['x-Service-Secret']) as string | undefined;
   if (!serviceSecret || serviceSecret !== process.env.SERVICE_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
   }
@@ -1752,7 +1768,7 @@ export async function handleHemiMyEvents(req: VercelRequest, res: VercelResponse
 export async function handleCronHemiPing(req: VercelRequest, res: VercelResponse) {
   const authHeader = req.headers.authorization;
   const cronSecret = process.env.CRON_SECRET;
-  if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
+  if (!cronSecret || authHeader !== `Bearer ${cronSecret}`) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
